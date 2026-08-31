@@ -309,10 +309,33 @@ function foldPunctuation(s){
   return s.replace(/ {2,}/g, " ").trim();
 }
 
+var WEAK_LINE_END = /^(a|an|the|and|or|but|nor|so|yet|of|to|in|on|at|by|for|with|from|as|into|onto|is|are|was|were|be|been|being|am|do|does|did|has|have|had|will|would|can|could|shall|should|may|might|must|that|this|these|those|his|her|its|their|our|your|my)$/i;
+
 function wrapText(s, max){
-  var words = s.split(/\s+/).filter(Boolean), lines = [], cur = "";
-  for(var i=0;i<words.length;i++){
-    var w = words[i];
+  var words = s.split(/\s+/).filter(Boolean);
+  if(!words.length) return [];
+  var whole = words.join(" ");
+  if(whole.length <= max) return [whole];
+
+  /* Two lines is the caption norm, so when the text fits on two, pick the break
+     that balances them instead of filling line one to the brim and stranding a
+     word below it. Nudge away from breaks that would end a line on an article,
+     preposition, conjunction or auxiliary verb, which is what caption style
+     guides ask for. */
+  var best = null;
+  for(var i=1;i<words.length;i++){
+    if(words[i] === "-") continue;              // never start a line on a bare hyphen
+    var a = words.slice(0,i).join(" "), b = words.slice(i).join(" ");
+    if(a.length > max || b.length > max) continue;
+    var score = Math.abs(a.length - b.length);
+    if(WEAK_LINE_END.test(words[i-1])) score += 12;
+    if(best === null || score < best.score) best = { score: score, lines: [a, b] };
+  }
+  if(best) return best.lines;
+
+  var lines = [], cur = "";
+  for(var j=0;j<words.length;j++){
+    var w = words[j];
     if(!cur) cur = w;
     else if((cur+" "+w).length <= max || w === "-") cur += " " + w;
     else { lines.push(cur); cur = w; }
