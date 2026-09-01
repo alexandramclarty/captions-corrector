@@ -162,11 +162,12 @@
   <p class="lede">Apply the wording and punctuation from your edited transcript to a caption file. Headings, lists and paragraph breaks are ignored. Timings are never modified.</p>
 
   <div class="error" id="error" hidden></div>
+  <div class="flag" id="modenote" hidden style="margin-bottom:20px"></div>
 
   <div class="slots">
     <div class="slot" id="slot-srt">
       <h3>Caption file</h3>
-      <p class="hint">The .srt your captioning tool produced. Drop it here or browse.</p>
+      <p class="hint">The .srt your captioning tool produced. If you export one word per segment, the tool rebuilds the cue boundaries instead of keeping them.</p>
       <label>Choose .srt<input type="file" id="srt" accept=".srt,text/plain"></label>
       <p class="filename" id="srt-name"></p>
     </div>
@@ -208,6 +209,21 @@
           <option value="keep" selected>Keep the original text and flag it</option>
           <option value="drop">Remove the cue</option>
         </select>
+      </div>
+      <div class="field" id="rebuild-settings" hidden>
+        <label for="cpl">Rebuild cues at</label>
+        <input type="number" id="cpl" value="80" min="20" max="120">
+        <label for="cpl">characters, on</label>
+        <select id="mlines"><option value="1" selected>one line</option><option value="2">up to two lines</option></select>
+        <p class="note">One line lets the player wrap, which suits desktop viewing. Two lines puts the break under your control, which matters more on phones. Cue boundaries are chosen the same way either way.</p>
+      </div>
+      <div class="field" id="rebuild-dur" hidden>
+        <label for="maxDur">Cue length between</label>
+        <input type="number" id="minDur" value="1.0" min="0.3" max="3" step="0.1">
+        <label for="maxDur">and</label>
+        <input type="number" id="maxDur" value="6" min="2" max="12" step="0.5">
+        <label for="maxDur">seconds</label>
+        <p class="note">The minimum is a preference, not a rule. A short complete sentence bounded by real pauses is allowed to stay short.</p>
       </div>
       <div class="field">
         <label><input type="checkbox" id="ascii" checked> Use plain quotes and dashes in the captions</label>
@@ -304,12 +320,24 @@ var ASCII_FOLD = [
   [/[\u00a0\u2007\u2009\u200a\u202f]/g, " "],
   [/[\u200b\u200c\u200d\ufeff]/g, ""]
 ];
+function msToTc(v){
+  v = Math.round(v);
+  var h = Math.floor(v/3600000); v -= h*3600000;
+  var m = Math.floor(v/60000);   v -= m*60000;
+  var sec = Math.floor(v/1000);
+  return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+
+         String(sec).padStart(2,"0")+","+String(v-sec*1000).padStart(3,"0");
+}
+
 function foldPunctuation(s){
   for(var i=0;i<ASCII_FOLD.length;i++) s = s.replace(ASCII_FOLD[i][0], ASCII_FOLD[i][1]);
   return s.replace(/ {2,}/g, " ").trim();
 }
 
-var WEAK_LINE_END = /^(a|an|the|and|or|but|nor|so|yet|of|to|in|on|at|by|for|with|from|as|into|onto|is|are|was|were|be|been|being|am|do|does|did|has|have|had|will|would|can|could|shall|should|may|might|must|that|this|these|those|his|her|its|their|our|your|my)$/i;
+/* Words a caption line should not end on: articles, prepositions, conjunctions,
+   auxiliaries and subject pronouns. Breaking after any of these separates a
+   phrase from its head, or a subject from its verb. */
+var WEAK_LINE_END = /^(a|an|the|and|or|but|nor|so|yet|of|to|in|on|at|by|for|with|from|as|into|onto|is|are|was|were|be|been|being|am|do|does|did|has|have|had|will|would|shall|should|can|could|may|might|must|that|this|these|those|his|her|its|their|our|your|my|i|we|you|they|he|she|it|there|who|whom|whose|which|because|while|since|when|if|though|although|unless|until|than)$/i;
 
 function wrapText(s, max){
   var words = s.split(/\s+/).filter(Boolean);
@@ -327,8 +355,10 @@ function wrapText(s, max){
     if(words[i] === "-") continue;              // never start a line on a bare hyphen
     var a = words.slice(0,i).join(" "), b = words.slice(i).join(" ");
     if(a.length > max || b.length > max) continue;
-    var score = Math.abs(a.length - b.length);
-    if(WEAK_LINE_END.test(words[i-1])) score += 12;
+    var score = Math.abs(a.length - b.length), prev = words[i-1];
+    if(/[.!?]["')\u201d\u2019]?$/.test(prev)) score -= 16;
+    else if(/[,;:]["')\u201d\u2019]?$/.test(prev)) score -= 12;
+    else if(WEAK_LINE_END.test(prev.replace(/[^A-Za-z']/g,""))) score += 34;
     if(best === null || score < best.score) best = { score: score, lines: [a, b] };
   }
   if(best) return best.lines;
@@ -524,7 +554,13 @@ function run(){
     cps: Math.max(5, parseInt($("cps").value,10) || 21),
     emptyCue: $("emptyCue").value,
     ascii: $("ascii").checked,
-    stripSpeaker: $("stripSpeaker").checked
+    stripSpeaker: $("stripSpeaker").checked,
+    maxCharsPerLine: Math.max(20, parseInt($("cpl").value,10) || 80),
+    maxLines: parseInt($("mlines").value,10) || 1,
+    maxDur: Math.max(2000, (parseFloat($("maxDur").value)||6)*1000),
+    minDur: Math.max(300, (parseFloat($("minDur").value)||1)*1000),
+    fillWeight:55, wSentence:0, wClause:10, wWeak:45, wPlain:22,
+    pauseCredit:26, pauseFull:700, wInternalSentence:110
   };
 
   $("run").disabled = true;
@@ -541,14 +577,17 @@ function run(){
         );
       }
       return docxToBlocks(buf).then(function(doc){
-        process(srtText, doc, cfg);
+        var parsed = parseSRT(srtText);
+        if(!parsed.cues.length) throw new Error("No caption cues found in that .srt file.");
+        if(isWordLevel(parsed.cues)) processWordLevel(parsed, doc, cfg);
+        else process(srtText, doc, cfg);
       });
     });
   }).catch(function(err){
     showError(err && err.message ? err.message : "Something went wrong reading the files.");
   }).then(function(){
     $("run").disabled = false;
-    $("run").textContent = "Correct captions";
+    $("run").textContent = $("rebuild-settings").hidden ? "Correct captions" : "Rebuild captions";
   });
 }
 
@@ -856,6 +895,272 @@ function render(r){
   $("results").scrollIntoView({behavior:"smooth", block:"start"});
 }
 
+
+/* ================= rebuild mode =================
+   When the caption file is one word per cue, we are holding the ASR's own
+   word-level timings. Rather than inheriting cue boundaries chosen by a word
+   cap, we choose them ourselves and read each boundary straight off the word
+   that sits there. No timestamp is invented or shifted. */
+
+function isWordLevel(cues){
+  if(cues.length < 50) return false;
+  var counts = cues.map(function(c){ return c.rawText.split(/\s+/).filter(Boolean).length; }).sort(function(a,b){return a-b;});
+  return counts[Math.floor(counts.length/2)] <= 1;
+}
+
+/* align the transcript onto the timed words, carrying timings through */
+function buildTimedStream(words, transTokens, cfg){
+  var capNorm = words.map(function(w){ return normalize(w.text); });
+  var ops = buildOps(capNorm, transTokens.map(function(t){ return t.norm; }));
+  var out = [], dropped = 0, replaced = 0, inserted = 0;
+
+  function emit(text, start, end, src, idx){ out.push({text:text,start:start,end:end,src:src,idx:idx}); }
+
+  for(var o=0;o<ops.length;o++){
+    var op = ops[o], k;
+    if(op.type === "equal"){
+      for(k=0;k<op.c1-op.c0;k++){
+        var w = words[op.c0+k], t = transTokens[op.t0+k];
+        emit(t.text, w.start, w.end, "t", op.t0+k);
+      }
+      continue;
+    }
+    if(op.type === "sub"){
+      var body = [];
+      for(k=op.t0;k<op.t1;k++) if(!transTokens[k].heading) body.push(k);
+      var capLen = op.c1 - op.c0;
+      if(!body.length || capLen > cfg.maxRun || body.length > cfg.maxRun){
+        for(k=0;k<capLen;k++) emit(words[op.c0+k].text, words[op.c0+k].start, words[op.c0+k].end, "c", op.c0+k);
+      } else {
+        /* spread the replacement across the span the originals occupied */
+        var s0 = words[op.c0].start, e0 = words[op.c0+capLen-1].end, step = (e0-s0)/body.length;
+        for(k=0;k<body.length;k++) emit(transTokens[body[k]].text, s0+k*step, s0+(k+1)*step, "t", body[k]);
+        replaced++;
+      }
+      continue;
+    }
+    if(op.type === "del"){
+      var delLen = op.c1 - op.c0;
+      if(delLen > cfg.maxRun){
+        for(k=0;k<delLen;k++) emit(words[op.c0+k].text, words[op.c0+k].start, words[op.c0+k].end, "c", op.c0+k);
+      } else dropped += delLen;
+      continue;
+    }
+    var ibody = [];
+    for(k=op.t0;k<op.t1;k++) if(!transTokens[k].heading) ibody.push(k);
+    if(!ibody.length || ibody.length > cfg.maxRun) continue;
+    /* a word with no audio of its own sits at the seam, zero width */
+    var at = op.c0 < words.length ? words[op.c0].start
+           : (words.length ? words[words.length-1].end : 0);
+    for(k=0;k<ibody.length;k++) emit(transTokens[ibody[k]].text, at, at, "t", ibody[k]);
+    inserted++;
+  }
+
+  /* Folding changes lengths, so it must happen before anything measures a line.
+     A fold that splits one token into several divides that token's span. */
+  var folded = [];
+  for(var i=0;i<out.length;i++){
+    var tok = out[i];
+    if(!cfg.ascii){ folded.push(tok); continue; }
+    var parts = foldPunctuation(tok.text).split(" ").filter(Boolean);
+    if(parts.length <= 1){
+      folded.push({text:parts[0]||tok.text,start:tok.start,end:tok.end,src:tok.src,idx:tok.idx,part:parts.length?undefined:0});
+    } else {
+      var st = (tok.end - tok.start) / parts.length;
+      for(var p=0;p<parts.length;p++)
+        folded.push({text:parts[p],start:tok.start+p*st,end:tok.start+(p+1)*st,src:tok.src,idx:tok.idx,part:p});
+    }
+  }
+  return { stream: folded, dropped: dropped, replaced: replaced, inserted: inserted };
+}
+
+/* choose cue boundaries by minimising a cost over the whole transcript */
+function segmentStream(stream, o){
+  var cap = o.maxCharsPerLine * o.maxLines, n = stream.length;
+  var txt = stream.map(function(w){ return w.text; });
+  var pre = [0];
+  for(var i=0;i<n;i++) pre.push(pre[i] + txt[i].length + 1);
+  function chars(a,b){ return pre[b]-pre[a]-1; }
+  function gapAfter(i){ return i+1<n ? Math.max(0, stream[i+1].start - stream[i].end) : o.pauseFull; }
+  function isSentEnd(t){ return /[.!?]["')\u201d\u2019]?$/.test(t); }
+  var sentPre = [0];
+  for(i=0;i<n;i++) sentPre.push(sentPre[i] + (isSentEnd(txt[i]) ? 1 : 0));
+
+  function fits(a,b){
+    if(chars(a,b) > cap) return false;
+    if(o.maxLines === 1) return chars(a,b) <= o.maxCharsPerLine;
+    return wrapText(txt.slice(a,b).join(" "), o.maxCharsPerLine).length <= o.maxLines;
+  }
+  function breakCost(j){
+    if(j >= n) return 0;
+    var last = txt[j-1], g = gapAfter(j-1), c;
+    if(isSentEnd(last)) c = o.wSentence;
+    else if(/[,;:]["')\u201d\u2019]?$/.test(last)) c = o.wClause;
+    else if(WEAK_LINE_END.test(last.replace(/[^A-Za-z']/g,""))) c = o.wWeak;
+    else c = o.wPlain;
+    return Math.max(0, c - Math.min(g, o.pauseFull)/o.pauseFull*o.pauseCredit);
+  }
+
+  var best = new Array(n+1).fill(Infinity), from = new Array(n+1).fill(-1);
+  best[0] = 0;
+  for(var j=1;j<=n;j++){
+    for(i=j-1;i>=0;i--){
+      if(chars(i,j) > cap) break;
+      if(best[i] === Infinity) continue;
+      var dur = stream[j-1].end - stream[i].start;
+      if(dur > o.maxDur) break;
+      if(!fits(i,j)) continue;
+      var slack = (cap - chars(i,j)) / cap;
+      var c = best[i] + o.fillWeight*slack*slack + breakCost(j)
+            + o.wInternalSentence*(sentPre[j-1] - sentPre[i]);
+      if(dur < o.minDur) c += o.fillWeight*0.9*(1 - dur/o.minDur);
+      if(c < best[j]){ best[j] = c; from[j] = i; }
+    }
+  }
+  var spans = [], k = n;
+  while(k > 0){ spans.push([from[k], k]); k = from[k]; }
+  spans.reverse();
+  return spans.map(function(sp){
+    var slice = txt.slice(sp[0], sp[1]);
+    return {
+      start: stream[sp[0]].start,
+      end:   stream[sp[1]-1].end,
+      lines: o.maxLines === 1 ? [slice.join(" ")] : wrapText(slice.join(" "), o.maxCharsPerLine),
+      i0: sp[0], i1: sp[1]
+    };
+  });
+}
+
+function processWordLevel(parsed, doc, cfg){
+  var words = [];
+  for(var i=0;i<parsed.cues.length;i++){
+    var c = parsed.cues[i];
+    var t = cueTextForMatching(c.rawText);
+    if(!t) continue;
+    var p = c.timing.split("-->");
+    var a = tcToMs(p[0]||""), e = tcToMs(p[1]||"");
+    if(a === null || e === null) continue;
+    words.push({ text: t, start: a, end: e });
+  }
+  if(words.length < 50) throw new Error("That word-level file has too few timed words to work with.");
+
+  var transTokens = tokenizeTranscript(doc.blocks, cfg.stripSpeaker);
+  if(!transTokens.length) throw new Error("No text found in that Word document.");
+
+  var overlap = overlapRatio(words.map(function(w){ return normalize(w.text); }),
+                             transTokens.map(function(t){ return t.norm; }));
+  if(overlap < 0.6) throw new Error(
+    "These two files only share " + Math.round(overlap*100) + "% of their words, so they don't look " +
+    "like the same recording. Check that the transcript and the caption file are from the same webinar.");
+
+  var built = buildTimedStream(words, transTokens, cfg);
+  var cues  = segmentStream(built.stream, cfg);
+
+  /* --- verification --- */
+  var allowed = Object.create(null), q;
+  function allow(text){
+    var parts = (cfg.ascii ? foldPunctuation(text) : text).split(" ").filter(Boolean);
+    for(var z=0;z<parts.length;z++) allowed[parts[z]] = (allowed[parts[z]]||0) + 1;
+  }
+  for(q=0;q<words.length;q++) allow(words[q].text);
+  for(q=0;q<transTokens.length;q++) allow(transTokens[q].text);
+
+  var pool = Object.create(null);
+  for(q in allowed) pool[q] = allowed[q];
+  var unsourced = 0, emitted = 0;
+  for(q=0;q<built.stream.length;q++){
+    var w = built.stream[q].text;
+    emitted++;
+    if(!pool[w]) unsourced++; else pool[w]--;
+  }
+
+  var wStart = Object.create(null), wEnd = Object.create(null);
+  for(q=0;q<words.length;q++){ wStart[words[q].start] = 1; wEnd[words[q].end] = 1; }
+  var offGrid = 0, disorder = 0, overlaps = 0;
+  for(q=0;q<cues.length;q++){
+    if(!wStart[cues[q].start] || !wEnd[cues[q].end]) offGrid++;
+    if(q && cues[q].start < cues[q-1].start) disorder++;
+    if(q && cues[q].start < cues[q-1].end) overlaps++;
+  }
+  var provenanceOK = (unsourced === 0 && disorder === 0 && overlaps === 0);
+
+  var outCues = cues.map(function(c){
+    return { timing: msToTc(c.start)+" --> "+msToTc(c.end), text: c.lines.join("\n") };
+  });
+  outputSRT  = serializeSRT(outCues, parsed.crlf);
+  outputName = (srtFile.name || "captions").replace(/\.srt$/i,"") + "-rebuilt.srt";
+
+  /* --- quality report --- */
+  var flags = [], flat = cues.map(function(c){ return c.lines.join(" "); });
+  var weak = 0, onew = 0, shortCue = 0, endsSent = 0, longLine = 0;
+  for(q=0;q<cues.length;q++){
+    var t2 = flat[q], last = t2.split(" ").pop().replace(/[^A-Za-z']/g,"");
+    if(WEAK_LINE_END.test(last) && !/[.!?,;:]["')\u201d\u2019]?$/.test(t2)) weak++;
+    if(t2.split(" ").length === 1) onew++;
+    var d = (cues[q].end - cues[q].start)/1000;
+    if(d < cfg.minDur/1000) shortCue++;
+    if(/[.!?]["')\u201d\u2019]?$/.test(t2)) endsSent++;
+    for(var L=0;L<cues[q].lines.length;L++) if(cues[q].lines[L].length > cfg.maxCharsPerLine) longLine++;
+  }
+  if(offGrid) flags.push({cue:0,warn:true,text:offGrid+" cue boundary/boundaries did not land on a measured word. Do not use this file."});
+  if(longLine) flags.push({cue:0,warn:true,text:longLine+" line(s) exceed your character limit."});
+  if(shortCue) flags.push({cue:0,warn:false,text:shortCue+" cue(s) are shorter than your minimum. These are usually short complete sentences bounded by real pauses."});
+  if(built.dropped) flags.push({cue:0,warn:false,text:built.dropped+" spoken word(s) were cut, matching your transcript."});
+  if(!doc.headings) flags.push({cue:0,warn:true,text:"No headings were found in the Word document. If you added headings, make sure they use Word's Heading styles."});
+
+  renderRebuild({
+    words: words.length, cues: cues, outCues: outCues, flags: flags,
+    weak: weak, onew: onew, shortCue: shortCue, endsSent: endsSent,
+    emitted: emitted, unsourced: unsourced, offGrid: offGrid,
+    provenanceOK: provenanceOK, cfg: cfg, built: built
+  });
+}
+
+function renderRebuild(r){
+  var pct = function(x){ return Math.round(100*x/r.cues.length) + "%"; };
+  var stats = [
+    "<b>"+r.words.toLocaleString()+"</b><span>timed words in</span>",
+    "<b>"+r.cues.length+"</b><span>cues built</span>",
+    "<b>"+r.weak+"</b><span>end mid-phrase</span>",
+    "<b>"+r.onew+"</b><span>one-word cues</span>",
+    "<b>"+pct(r.endsSent)+"</b><span>end on a sentence</span>"
+  ];
+  $("stats").innerHTML = stats.map(function(x){ return '<p class="stat">'+x+'</p>'; }).join("");
+
+  var v = $("verified");
+  if(r.provenanceOK){
+    v.className = "verified";
+    v.textContent = "Checked: all " + r.emitted.toLocaleString() + " words trace back to one of your two files, "
+      + "and every cue boundary sits on a timestamp measured for that word. Nothing was shifted or invented.";
+  } else {
+    v.className = "verified bad";
+    v.textContent = "The output failed its own consistency check (" + r.unsourced + " unsourced word(s), "
+      + r.offGrid + " boundary/boundaries off the word grid). Don't use this file.";
+  }
+
+  $("flags").innerHTML = r.flags.map(function(f){
+    return '<div class="flag'+(f.warn?"":" info")+'">'+esc(f.text)+'</div>';
+  }).join("");
+
+  $("changes-heading").textContent = "Rebuilt cues";
+  var LIMIT = 200;
+  $("cues").innerHTML = r.cues.slice(0, LIMIT).map(function(c,i){
+    var dur = (c.end - c.start)/1000;
+    var rate = dur > 0 ? c.lines.join(" ").length/dur : 0;
+    return '<div class="cue">' +
+      '<div class="cue-meta"><span class="cue-n">'+(i+1)+'</span>' +
+      '<span class="cue-tc">'+esc(msToTc(c.start)+" --> "+msToTc(c.end))+'</span>' +
+      '<span class="cue-cps'+(rate>r.cfg.cps?" over":"")+'">'+rate.toFixed(0)+' cps</span></div>' +
+      '<p class="cue-text">'+esc(c.lines.join("\n")).replace(/\n/g,"<br>")+'</p></div>';
+  }).join("");
+  $("more").textContent = r.cues.length > LIMIT
+    ? "Showing the first " + LIMIT + " of " + r.cues.length + " cues. All of them are in the download." : "";
+
+  $("download").disabled = !r.provenanceOK;
+  $("results").hidden = false;
+  $("results").scrollIntoView({behavior:"smooth", block:"start"});
+}
+
 /* ---------- wiring ---------- */
 
 function setFile(which, file){
@@ -872,7 +1177,30 @@ function setFile(which, file){
   clearError();
 }
 
-$("srt").addEventListener("change", function(e){ setFile("srt", e.target.files[0]); });
+function showMode(wordLevel){
+  $("rebuild-settings").hidden = !wordLevel;
+  $("rebuild-dur").hidden = !wordLevel;
+  $("autoWrap").closest(".field").hidden = wordLevel;
+  $("maxLine").closest(".field").hidden = wordLevel;
+  $("emptyCue").closest(".field").hidden = wordLevel;
+  var note = $("modenote");
+  note.hidden = false;
+  note.innerHTML = wordLevel
+    ? "<b>Rebuild mode.</b> This file is one word per cue, so it carries the recogniser's own word timings. "
+      + "The tool will choose new cue boundaries and read each one off the word that sits there."
+    : "<b>Correction mode.</b> This file has normal cues, so they'll be kept exactly as they are and only the wording changes. "
+      + "To rebuild the boundaries too, re-export with one word per segment.";
+  $("run").textContent = wordLevel ? "Rebuild captions" : "Correct captions";
+}
+
+$("srt").addEventListener("change", function(e){
+  var f = e.target.files[0];
+  setFile("srt", f);
+  if(f) f.text().then(function(t){
+    var p = parseSRT(t);
+    if(p.cues.length) showMode(isWordLevel(p.cues));
+  }).catch(function(){});
+});
 $("docx").addEventListener("change", function(e){
   var f = e.target.files[0];
   if(f && !/\.docx$/i.test(f.name)){
