@@ -971,6 +971,16 @@ function buildTimedStream(words, transTokens, cfg){
         folded.push({text:parts[p],start:tok.start+p*st,end:tok.start+(p+1)*st,src:tok.src,idx:tok.idx,part:p});
     }
   }
+  /* A token's start or end is "on the grid" only if the recogniser actually
+     measured a word boundary there. Interpolated points -- inside a multi-word
+     correction, at an added word, or inside a token punctuation-folding split
+     -- are estimates, and a cue must never begin or end on one. */
+  var gridStart = Object.create(null), gridEnd = Object.create(null);
+  for(var g=0;g<words.length;g++){ gridStart[words[g].start] = 1; gridEnd[words[g].end] = 1; }
+  for(var f=0;f<folded.length;f++){
+    folded[f].gs = !!gridStart[folded[f].start];
+    folded[f].ge = !!gridEnd[folded[f].end];
+  }
   return { stream: folded, dropped: dropped, replaced: replaced, inserted: inserted };
 }
 
@@ -1001,26 +1011,40 @@ function segmentStream(stream, o){
     return Math.max(0, c - Math.min(g, o.pauseFull)/o.pauseFull*o.pauseCredit);
   }
 
-  var best = new Array(n+1).fill(Infinity), from = new Array(n+1).fill(-1);
-  best[0] = 0;
-  for(var j=1;j<=n;j++){
-    for(i=j-1;i>=0;i--){
-      if(chars(i,j) > cap) break;
-      if(best[i] === Infinity) continue;
-      var dur = stream[j-1].end - stream[i].start;
-      if(dur > o.maxDur) break;
-      if(!fits(i,j)) continue;
-      var slack = (cap - chars(i,j)) / cap;
-      var c = best[i] + o.fillWeight*slack*slack + breakCost(j)
-            + o.wInternalSentence*(sentPre[j-1] - sentPre[i]);
-      if(dur < o.minDur) c += o.fillWeight*0.9*(1 - dur/o.minDur);
-      if(c < best[j]){ best[j] = c; from[j] = i; }
+  function solve(onGridOnly){
+    var canStart = function(a){ return a === 0 || !onGridOnly || stream[a].gs !== false; };
+    var canEnd   = function(b){ return b === n || !onGridOnly || stream[b-1].ge !== false; };
+    var bst = new Array(n+1).fill(Infinity), frm = new Array(n+1).fill(-1);
+    bst[0] = 0;
+    for(var j=1;j<=n;j++){
+      if(!canEnd(j)) continue;
+      for(var i=j-1;i>=0;i--){
+        if(chars(i,j) > cap) break;
+        if(bst[i] === Infinity || !canStart(i)) continue;
+        var dur = stream[j-1].end - stream[i].start;
+        if(dur > o.maxDur) break;
+        if(!fits(i,j)) continue;
+        var slack = (cap - chars(i,j)) / cap;
+        var c = bst[i] + o.fillWeight*slack*slack + breakCost(j)
+              + o.wInternalSentence*(sentPre[j-1] - sentPre[i]);
+        if(dur < o.minDur) c += o.fillWeight*0.9*(1 - dur/o.minDur);
+        if(c < bst[j]){ bst[j] = c; frm[j] = i; }
+      }
     }
+    return { best: bst, from: frm };
   }
+
+  /* Prefer a solution that only ever breaks on measured boundaries. If the
+     constraint leaves no way to segment the transcript, fall back and say so
+     rather than producing nothing. */
+  var sol = solve(true), relaxed = false;
+  if(sol.best[n] === Infinity){ sol = solve(false); relaxed = true; }
+  var best = sol.best, from = sol.from;
+
   var spans = [], k = n;
   while(k > 0){ spans.push([from[k], k]); k = from[k]; }
   spans.reverse();
-  return spans.map(function(sp){
+  var built = spans.map(function(sp){
     var slice = txt.slice(sp[0], sp[1]);
     return {
       start: stream[sp[0]].start,
@@ -1029,6 +1053,8 @@ function segmentStream(stream, o){
       i0: sp[0], i1: sp[1]
     };
   });
+  built.relaxed = relaxed;
+  return built;
 }
 
 function processWordLevel(parsed, doc, cfg){
@@ -1076,9 +1102,18 @@ function processWordLevel(parsed, doc, cfg){
 
   var wStart = Object.create(null), wEnd = Object.create(null);
   for(q=0;q<words.length;q++){ wStart[words[q].start] = 1; wEnd[words[q].end] = 1; }
-  var offGrid = 0, disorder = 0, overlaps = 0;
+  var offGrid = 0, disorder = 0, overlaps = 0, offList = [];
   for(q=0;q<cues.length;q++){
-    if(!wStart[cues[q].start] || !wEnd[cues[q].end]) offGrid++;
+    if(!wStart[cues[q].start] || !wEnd[cues[q].end]){
+      offGrid++;
+      if(offList.length < 12) offList.push({
+        n: q+1,
+        badStart: !wStart[cues[q].start],
+        badEnd: !wEnd[cues[q].end],
+        timing: msToTc(cues[q].start)+" --> "+msToTc(cues[q].end),
+        text: cues[q].lines.join(" ")
+      });
+    }
     if(q && cues[q].start < cues[q-1].start) disorder++;
     if(q && cues[q].start < cues[q-1].end) overlaps++;
   }
@@ -1102,7 +1137,19 @@ function processWordLevel(parsed, doc, cfg){
     if(/[.!?]["')\u201d\u2019]?$/.test(t2)) endsSent++;
     for(var L=0;L<cues[q].lines.length;L++) if(cues[q].lines[L].length > cfg.maxCharsPerLine) longLine++;
   }
-  if(offGrid) flags.push({cue:0,warn:true,text:offGrid+" cue boundary/boundaries did not land on a measured word. Do not use this file."});
+  if(offGrid){
+    var where = offList.map(function(x){
+      return "cue " + x.n + " (" + x.timing + ", " + (x.badStart && x.badEnd ? "both ends" : x.badStart ? "start" : "end") + "): \u201c" + x.text + "\u201d";
+    }).join("  \u2022  ");
+    flags.push({cue:0,warn:true,text:
+      offGrid + " cue boundary/boundaries did not land on a measured word, so their timing is an estimate rather than a measurement. "
+      + (cues.relaxed
+          ? "This happened because no segmentation was possible using measured boundaries only \u2014 try a larger character limit. "
+          : "")
+      + "Affected: " + where + (offGrid > offList.length ? "  \u2026 and " + (offGrid-offList.length) + " more." : "")});
+  }
+  if(cues.relaxed && !offGrid) flags.push({cue:0,warn:false,text:
+    "No segmentation was possible using measured boundaries only, so the constraint was relaxed \u2014 but every boundary still landed on a measured word."});
   if(longLine) flags.push({cue:0,warn:true,text:longLine+" line(s) exceed your character limit."});
   if(shortCue) flags.push({cue:0,warn:false,text:shortCue+" cue(s) are shorter than your minimum. These are usually short complete sentences bounded by real pauses."});
   if(built.dropped) flags.push({cue:0,warn:false,text:built.dropped+" spoken word(s) were cut, matching your transcript."});
